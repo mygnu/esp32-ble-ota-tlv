@@ -11,7 +11,7 @@ CONFIG_BTDM_CTRL_MODE_BLE_ONLY=y
 # Prefer larger MTU for fewer packets
 CONFIG_BT_NIMBLE_ATT_PREFERRED_MTU=527
 
-# NimBLE host stack (needs to be non-trivial if you do work in callbacks)
+# NimBLE host stack (needs to be non-trivial if you do work in callbacks i.e. Verifying firmware signature)
 CONFIG_BT_NIMBLE_HOST_TASK_STACK_SIZE=18432
 
 # Logging (keep it simple)

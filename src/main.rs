@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 
 use esp32_nimble::utilities::BleUuid;
@@ -12,80 +12,10 @@ const STATUS_UUID: BleUuid = uuid128!("02000000-0000-4000-8000-000053544154");
 const CONTROL_UUID: BleUuid = uuid128!("03000000-0000-4000-8000-00004354524C");
 const OTA_UUID: BleUuid = uuid128!("05000000-0000-4000-8000-00004F544100");
 
-// Example TLV commands
-const TAG_PING: u8 = 0x01;
-const TAG_ECHO: u8 = 0x02;
-const TAG_ACTION: u8 = 0x05;
-const TAG_SET_CONFIG: u8 = 0x20;
-
 // OTA TLV commands
 const TAG_OTA_BEGIN: u8 = ota::TAG_OTA_BEGIN;
 const TAG_OTA_CHUNK: u8 = ota::TAG_OTA_CHUNK;
 const TAG_OTA_COMMIT: u8 = ota::TAG_OTA_COMMIT;
-
-// Nested TLVs inside SET_CONFIG (and echoed back via CONTROL read)
-const TAG_CFG_NAME: u8 = 0x06;
-const TAG_CFG_NEAR_FAR_THRESHOLD: u8 = 0x0A;
-const TAG_CFG_INITIAL_QUIET: u8 = 0x0B;
-const TAG_CFG_ALARM_ESCALATION_AFTER: u8 = 0x0C;
-
-// Response tags (returned by STATUS read)
-const TAG_STATUS_PING_COUNT: u8 = 0x10;
-const TAG_STATUS_LAST_ECHO_LEN: u8 = 0x11;
-const TAG_STATUS_CONFIG_VERSION: u8 = 0x12;
-const TAG_STATUS_LAST_ACTION: u8 = 0x13;
-const TAG_STATUS_OTA_SUCCESS_COUNT: u8 = 0x14;
-
-static PING_COUNT: AtomicU32 = AtomicU32::new(0);
-static LAST_ECHO_LEN: AtomicU32 = AtomicU32::new(0);
-static ACTION_COUNT: AtomicU32 = AtomicU32::new(0);
-static CONFIG_VERSION: AtomicU32 = AtomicU32::new(0);
-static LAST_ACTION: AtomicU32 = AtomicU32::new(0);
-
-#[derive(Debug, Clone)]
-struct AppConfig {
-    name: heapless::String<20>,
-    near_far_threshold_dbm: i8,
-    initial_quiet_s: u8,
-    alarm_escalation_after_s: u8,
-}
-
-impl Default for AppConfig {
-    fn default() -> Self {
-        let mut name = heapless::String::new();
-        let _ = name.push_str("esp32-ble-tlv");
-
-        Self {
-            name,
-            near_far_threshold_dbm: -60,
-            initial_quiet_s: 8,
-            alarm_escalation_after_s: 5,
-        }
-    }
-}
-
-fn encode_config(cfg: &AppConfig) -> heapless::Vec<u8, 64> {
-    let mut out = heapless::Vec::<u8, 64>::new();
-
-    // Each item is a standard TLV: tag:u8 len:u8 value...
-    let _ = out.push(TAG_CFG_NAME);
-    let _ = out.push(cfg.name.len() as u8);
-    let _ = out.extend_from_slice(cfg.name.as_bytes());
-
-    let _ = out.push(TAG_CFG_NEAR_FAR_THRESHOLD);
-    let _ = out.push(1);
-    let _ = out.push(cfg.near_far_threshold_dbm as u8);
-
-    let _ = out.push(TAG_CFG_INITIAL_QUIET);
-    let _ = out.push(1);
-    let _ = out.push(cfg.initial_quiet_s);
-
-    let _ = out.push(TAG_CFG_ALARM_ESCALATION_AFTER);
-    let _ = out.push(1);
-    let _ = out.push(cfg.alarm_escalation_after_s);
-
-    out
-}
 
 fn main() -> anyhow::Result<()> {
     esp_idf_svc::sys::link_patches();
@@ -99,7 +29,7 @@ fn main() -> anyhow::Result<()> {
     let server = device.get_server();
     let service = server.create_service(SVC_UUID);
 
-    let config = Arc::new(Mutex::new(AppConfig::default()));
+    let config = Arc::new(Mutex::new(tlv::AppConfig::default()));
     let ota_mgr = Arc::new(Mutex::new(ota::OtaManager::default()));
 
     // STATUS: READ returns a response frame (status:u8 + TLVs)
@@ -108,35 +38,25 @@ fn main() -> anyhow::Result<()> {
         .create_characteristic(STATUS_UUID, NimbleProperties::READ);
 
     status_ch.lock().on_read(|ch, _| {
-        let ping = PING_COUNT.load(Ordering::Relaxed);
-        let echo_len = LAST_ECHO_LEN.load(Ordering::Relaxed);
-        let cfg_ver = CONFIG_VERSION.load(Ordering::Relaxed);
-        let last_action = LAST_ACTION.load(Ordering::Relaxed) as u8;
         let ota_success = ota::OTA_SUCCESS_COUNT.load(Ordering::Relaxed);
-
-        let mut resp = tlv::ResponseWriter::new(tlv::ResponseCode::Ok);
-        let _ = resp.push_tlv(TAG_STATUS_PING_COUNT, &ping.to_le_bytes());
-        let _ = resp.push_tlv(TAG_STATUS_LAST_ECHO_LEN, &echo_len.to_le_bytes());
-        let _ = resp.push_tlv(TAG_STATUS_CONFIG_VERSION, &cfg_ver.to_le_bytes());
-        let _ = resp.push_tlv(TAG_STATUS_LAST_ACTION, &[last_action]);
-        let _ = resp.push_tlv(TAG_STATUS_OTA_SUCCESS_COUNT, &ota_success.to_le_bytes());
-
+        let resp = tlv::build_status_response(ota_success);
         ch.set_value(resp.as_bytes());
     });
 
     // CONTROL: READ returns config; WRITE expects exactly one TLV
-    let ctrl_ch = service
-        .lock()
-        .create_characteristic(CONTROL_UUID, NimbleProperties::READ | NimbleProperties::WRITE);
+    let ctrl_ch = service.lock().create_characteristic(
+        CONTROL_UUID,
+        NimbleProperties::READ | NimbleProperties::WRITE,
+    );
 
     {
         let config = Arc::clone(&config);
         ctrl_ch.lock().on_read(move |ch, _| {
             let cfg = config.lock().expect("config mutex poisoned");
-            let cfg_bytes = encode_config(&cfg);
+            let cfg_bytes = cfg.encode();
 
             let mut resp = tlv::ResponseWriter::new(tlv::ResponseCode::Ok);
-            let _ = resp.push_tlv(TAG_SET_CONFIG, &cfg_bytes);
+            let _ = resp.push_tlv(tlv::TAG_SET_CONFIG, &cfg_bytes);
             ch.set_value(resp.as_bytes());
         });
     }
@@ -147,88 +67,39 @@ fn main() -> anyhow::Result<()> {
             let buf = ch.recv_data();
             match tlv::Tlv::parse_exact(buf) {
                 Ok(t) => match t.tag {
-                    TAG_PING => {
+                    tlv::TAG_PING => {
                         if !t.val.is_empty() {
                             log::warn!("PING expects len=0");
                             return;
                         }
-                        let n = PING_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+                        let n = tlv::PING_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
                         log::info!("PING #{n}");
                     }
-                    TAG_ECHO => {
-                        LAST_ECHO_LEN.store(t.val.len() as u32, Ordering::Relaxed);
+                    tlv::TAG_ECHO => {
+                        tlv::LAST_ECHO_LEN.store(t.val.len() as u32, Ordering::Relaxed);
                         log::info!("ECHO len={}", t.val.len());
                     }
-                    TAG_ACTION => {
+                    tlv::TAG_ACTION => {
                         if t.val.len() != 1 {
                             log::warn!("ACTION expects len=1");
                             return;
                         }
                         let action = t.val[0];
-                        let n = ACTION_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
-                        LAST_ACTION.store(action as u32, Ordering::Relaxed);
+                        let n = tlv::ACTION_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+                        tlv::LAST_ACTION.store(action as u32, Ordering::Relaxed);
                         log::info!("ACTION #{n} code=0x{action:02x}");
                     }
-                    TAG_SET_CONFIG => {
-                        // Parse nested TLV stream: {tag:u8,len:u8,val...}*
-                        let mut rest = t.val;
-                        let mut changed = false;
-
-                        while !rest.is_empty() {
-                            let (item, next) = match tlv::Tlv::parse_one(rest) {
-                                Ok(x) => x,
-                                Err(_) => {
-                                    log::warn!("Bad nested TLV in SET_CONFIG");
-                                    return;
-                                }
-                            };
-                            rest = next;
-
-                            let mut cfg = config.lock().expect("config mutex poisoned");
-                            match item.tag {
-                                TAG_CFG_NAME => {
-                                    if item.val.len() > 20 {
-                                        log::warn!("NAME too long (max 20)");
-                                        continue;
-                                    }
-                                    match core::str::from_utf8(item.val) {
-                                        Ok(s) => {
-                                            cfg.name.clear();
-                                            let _ = cfg.name.push_str(s);
-                                            changed = true;
-                                        }
-                                        Err(_) => {
-                                            log::warn!("NAME must be UTF-8");
-                                        }
-                                    }
-                                }
-                                TAG_CFG_NEAR_FAR_THRESHOLD => {
-                                    if item.val.len() == 1 {
-                                        cfg.near_far_threshold_dbm = i8::from_le_bytes([item.val[0]]);
-                                        changed = true;
-                                    }
-                                }
-                                TAG_CFG_INITIAL_QUIET => {
-                                    if item.val.len() == 1 {
-                                        cfg.initial_quiet_s = item.val[0];
-                                        changed = true;
-                                    }
-                                }
-                                TAG_CFG_ALARM_ESCALATION_AFTER => {
-                                    if item.val.len() == 1 {
-                                        cfg.alarm_escalation_after_s = item.val[0];
-                                        changed = true;
-                                    }
-                                }
-                                other => {
-                                    log::info!("Ignoring unknown config tag=0x{other:02x}");
-                                }
+                    tlv::TAG_SET_CONFIG => {
+                        let mut cfg = config.lock().expect("config mutex poisoned");
+                        match cfg.update_from_tlv(t.val) {
+                            Ok(true) => {
+                                let v = tlv::CONFIG_VERSION.fetch_add(1, Ordering::Relaxed) + 1;
+                                log::info!("Config updated; version={v}");
                             }
-                        }
-
-                        if changed {
-                            let v = CONFIG_VERSION.fetch_add(1, Ordering::Relaxed) + 1;
-                            log::info!("Config updated; version={v}");
+                            Ok(false) => {}
+                            Err(_) => {
+                                log::warn!("Bad nested TLV in SET_CONFIG");
+                            }
                         }
                     }
                     other => {
@@ -300,7 +171,11 @@ fn main() -> anyhow::Result<()> {
                 let offset = u32::from_le_bytes(val[0..4].try_into().unwrap());
                 let data = &val[4..];
 
-                match ota_mgr.lock().expect("ota mutex poisoned").chunk(offset, data) {
+                match ota_mgr
+                    .lock()
+                    .expect("ota mutex poisoned")
+                    .chunk(offset, data)
+                {
                     Ok(_) => {}
                     Err(e) => {
                         log::warn!("OTA_CHUNK failed: {e:?}");
