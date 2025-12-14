@@ -1,0 +1,20 @@
+# Minimal NimBLE config for esp32-ble-tlv example
+
+# Enable BLE (NimBLE)
+CONFIG_BT_ENABLED=y
+CONFIG_BT_BLE_ENABLED=y
+CONFIG_BT_BLUEDROID_ENABLED=n
+CONFIG_BT_NIMBLE_ENABLED=y
+CONFIG_BT_NIMBLE_NVS_PERSIST=y
+CONFIG_BTDM_CTRL_MODE_BLE_ONLY=y
+
+# Prefer larger MTU for fewer packets
+CONFIG_BT_NIMBLE_ATT_PREFERRED_MTU=527
+
+# NimBLE host stack (needs to be non-trivial if you do work in callbacks)
+CONFIG_BT_NIMBLE_HOST_TASK_STACK_SIZE=18432
+
+# Logging (keep it simple)
+CONFIG_LOG_DEFAULT_LEVEL_INFO=y
+CONFIG_LOG_DEFAULT_LEVEL=4
+CONFIG_LOG_COLORS=y
